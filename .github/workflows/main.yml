@@ -1,0 +1,84 @@
+name: macOS 
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Tailscale kur ve bağlan
+      env:
+        TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        brew install tailscale
+        sudo brew services start tailscale
+        sleep 10
+        sudo tailscale up --authkey="$TS_KEY" --accept-routes --hostname=macos-runner
+
+    - name: Uzak kullanıcıyı oluştur
+      env:
+        VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      run: |
+        PW="${VNC_PASSWORD:0:8}"
+
+        sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "$PW" -admin
+
+        # Şifre doğrulaması (şifreyi yazdırmaz)
+        if dscl . -authonly vncuser "$PW"; then
+          echo "OK: vncuser oluşturuldu ve şifre doğrulandı"
+        else
+          echo "HATA: vncuser şifresi doğrulanamadı"
+          exit 1
+        fi
+
+    - name: Siyah ekran düzeltmeleri (ekran uyanık tut + izinler)
+      run: |
+        # 1) Ekran ve sistem uykuya geçmesin
+        sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
+        sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0 || true
+        defaults -currentHost write com.apple.screensaver idleTime 0 || true
+        nohup caffeinate -dimsu > /dev/null 2>&1 &
+
+        # 2) Ekranı uyandır
+        caffeinate -u -t 5 || true
+
+        # 3) Ekran paylaşımı servisine ekran kaydı / kontrol izni vermeyi dene
+        TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+        for SVC in kTCCServiceScreenCapture kTCCServicePostEvent kTCCServiceAccessibility; do
+          for CLIENT in com.apple.screensharing.agent com.apple.RemoteDesktop; do
+            sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('$SVC','$CLIENT',0,2,4,1);" 2>&1 || echo "TCC yazılamadı: $SVC / $CLIENT (SIP kapalı olmayabilir)"
+          done
+        done
+
+        echo "Siyah ekran adımı bitti"
+
+    - name: Ekran paylaşımını aç
+      env:
+        VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      run: |
+        PW="${VNC_PASSWORD:0:8}"
+        KICK=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+
+        sudo $KICK -activate -configure -access -on \
+          -clientopts -setvnclegacy -vnclegacy yes \
+          -clientopts -setvncpw -vncpw "$PW" \
+          -restart -agent -privs -all
+
+        sudo launchctl kickstart -k system/com.apple.screensharing || true
+        sleep 8
+
+        echo "--- 5900 portu dinleniyor mu? ---"
+        sudo lsof -iTCP:5900 -sTCP:LISTEN || echo "UYARI: 5900 dinlenmiyor"
+
+    - name: Bağlantı bilgisi
+      run: |
+        echo "=============================================="
+        echo "Adres: $(tailscale ip -4)"
+        echo "Kullanıcı adı: vncuser"
+        echo "Şifre: VNC_PASSWORD secret'ının ilk 8 karakteri"
+        echo "=============================================="
+
+    - name: 6 saat canlı tut
+      run: sleep 21600
